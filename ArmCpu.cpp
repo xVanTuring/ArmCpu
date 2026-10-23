@@ -93,9 +93,14 @@ static uint32_t gTimerIntid = 27;
 // Redistributor ISENABLER0: SGIs 0..15 (only SGI 0 is used by the kernel; the others let the self-SGI probe tell which INTIDs the GIC accepts) and the timer PPI.
 static uint32_t sgiPpiEnable (void) { return 0xffffU | (1U << gTimerIntid); }
 
-// INTIDs base..base+7 stand for 'IPI to logical core 0..7': 1008 by default (sheng); boot-arg armcpu-spi-ipi-base=<INTID> for a
-// distributor without those INTIDs (the TB128FU's GIC has 544, and its DT leaves SPIs 430..511 unused).
+// INTIDs base..base+7 stand for 'IPI to logical core 0..7': boot-arg armcpu-spi-ipi-base=<INTID>, or without it the distributor's
+// top eight (GICD_TYPER.ITLinesNumber, below the special INTIDs 1020..1023): 1012 on a GIC with 1020 INTIDs such as sheng's
+// (its old fixed 1008 is the same block shifted by four), 536 on the TB128FU's GIC of 544 (its DT leaves SPIs 430..511 unused),
+// and on pipa's SM8250 whatever its distributor reports (its DT uses SPIs up to 863).
 static uint32_t gIpiSpiBase = 1008;
+static bool gIpiSpiBaseGiven = false;
+extern "C" volatile uint32_t armcpu_spi_ipi_base;   // the base in use, for the board's log
+volatile uint32_t armcpu_spi_ipi_base = 0;
 extern "C" {
 // Per logical core, read back after spiIpiConfigure: bit 0 IGROUPR (Group 1), bit 1 ISENABLER, bits 8..15 IPRIORITYR,
 // bits 16..31 the low half of IROUTER; 0xffffffff not configured.
@@ -283,6 +288,11 @@ bool ArmCpu::mapGic (void)
   gDist = dist;
   gFrames = redistBase;
   gFramesSize = redistSize;
+  if (!gIpiSpiBaseGiven) {
+    const uint32_t lines = ((read32 (dist, 0x4) & 0x1f) + 1) * 32;
+    gIpiSpiBase = (lines < 1020 ? lines : 1020) - 8;
+  }
+  armcpu_spi_ipi_base = gIpiSpiBase;
   return true;
 }
 
@@ -400,9 +410,11 @@ bool ArmCpu::start (IOService *provider)
   unsigned timerIntid = 27;
   PE_parse_boot_argn ("armcpu-timer-intid", &timerIntid, sizeof (timerIntid));
   if (timerIntid >= 16 && timerIntid < 32) { gTimerIntid = timerIntid; }
-  unsigned ipiBase = 1008;
-  PE_parse_boot_argn ("armcpu-spi-ipi-base", &ipiBase, sizeof (ipiBase));
-  if (ipiBase >= 32 && ipiBase + 8 <= 1020) { gIpiSpiBase = ipiBase; }
+  unsigned ipiBase = 0;
+  if (PE_parse_boot_argn ("armcpu-spi-ipi-base", &ipiBase, sizeof (ipiBase)) && ipiBase >= 32 && ipiBase + 8 <= 1020) {
+    gIpiSpiBase = ipiBase;
+    gIpiSpiBaseGiven = true;
+  }
   uint32_t physical;
   OSData *reg = OSDynamicCast (OSData, provider->getProperty ("reg"));
   memcpy (&physical, reg->getBytesNoCopy (), sizeof (physical));
