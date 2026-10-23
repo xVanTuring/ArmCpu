@@ -174,6 +174,29 @@ static class ArmCpu *volatile gPending[ARMCPU_SMP_SLOTS];
 static volatile uint32_t gBootRegistered = 0;
 static bool gRemoteGic = false; // sheng-smp-gic=1: the boot CPU prepares a new core's redistributor before CPU_ON
 
+// The cluster type the device tree gives a core (cpu node cluster-type "E" or "P", parsed by ml_parse_cpu_topology); a device
+// tree without it has every core of the boot cluster's type, as before.
+static cluster_type_t clusterType (uint32_t physical)
+{
+  const int cpu = ml_get_cpu_number (physical);
+  const ml_topology_info_t *topology = ml_get_topology_info ();
+  return ((cpu >= 0) && (topology != nullptr)) ? topology->cpus[cpu].cluster_type : ml_get_boot_cluster_type ();
+}
+
+// Once every core of the topology is registered, ml_cpu_init_completed: the Edge scheduler then sets the edges between clusters
+// (without it no thread migrates or is stolen across clusters). AppleARMSMP calls it after starting all cores; here they come up
+// through ArmCpu. With sheng-smp=0 only the boot core registers and nothing is called, as before.
+static volatile uint32_t gRegisteredCores = 0;
+volatile uint32_t armcpu_init_completed = 0;
+static void noteRegistered (void)
+{
+  const ml_topology_info_t *topology = ml_get_topology_info ();
+  if (__atomic_add_fetch (&gRegisteredCores, 1U, __ATOMIC_ACQ_REL) == topology->num_cpus) {
+    ml_cpu_init_completed ();
+    armcpu_init_completed = 1;
+  }
+}
+
 // Shared peripheral interrupts (GICv3 SPIs, INTID 32..1019). A driver attaches a handler for one INTID; the line is set to
 // Group 1 non-secure, priority 0xa0, the given trigger and routed to the boot CPU (GICD_IROUTER, affinity routing is on),
 // then enabled. The handler runs in the primary interrupt context, before the EOI, and must clear a level source.
@@ -432,12 +455,13 @@ bool ArmCpu::start (IOService *provider)
   info.phys_id = physical;
   info.log_id = logicalId;
   info.cluster_id = static_cast<uint32_t> (ml_get_cluster_number (physical));
-  info.cluster_type = ml_get_boot_cluster_type ();
+  info.cluster_type = clusterType (physical);
   perfmon_interrupt_handler_func pmi = nullptr;
   kern_return_t status = ml_processor_register (&info, &machProcessor, &ipi_handler, &pmi);
   if (status != KERN_SUCCESS) { panic ("ArmCpu: CPU %u registration failed: %d", logicalId, status); }
   setCPUNumber (info.log_id);
   armcpu_registered = 1;
+  noteRegistered ();
   unsigned smp = 0;
   PE_parse_boot_argn ("sheng-smp", &smp, sizeof (smp));
   gSmpWanted = smp != 0;
@@ -482,7 +506,7 @@ bool ArmCpu::finishSecondary (void)
   info.phys_id = static_cast<uint32_t> (affinity);
   info.log_id = logicalId;
   info.cluster_id = static_cast<uint32_t> (ml_get_cluster_number (static_cast<uint32_t> (affinity)));
-  info.cluster_type = ml_get_boot_cluster_type ();
+  info.cluster_type = clusterType (static_cast<uint32_t> (affinity));
   perfmon_interrupt_handler_func pmi = nullptr;
   kern_return_t status = ml_processor_register (&info, &machProcessor, &ipi_handler, &pmi);
   if (status != KERN_SUCCESS) { armcpu_smp_fail[logicalId] = 4; return false; }
@@ -491,6 +515,7 @@ bool ArmCpu::finishSecondary (void)
   setCPUState (kIOCPUStateUninitalized);
   registerService ();
   startSecondary ();
+  noteRegistered ();
   return true;
 }
 
